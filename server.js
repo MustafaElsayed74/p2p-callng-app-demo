@@ -14,12 +14,11 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3500;
 
-// Serve static assets from the public folder
 app.use(express.static(path.join(__dirname, 'public')));
 
 // In-memory user tracking:
-// usersByUserId: userId -> { socketId, name, inCallWith: null }
-// usersBySocketId: socketId -> userId
+// usersByUserId: userId -> { socketId, userId, userName }
+// usersBySocketId: socketId -> { socketId, userId, userName }
 const usersByUserId = new Map();
 const usersBySocketId = new Map();
 
@@ -33,45 +32,47 @@ function generateFriendlyId() {
 }
 
 io.on('connection', (socket) => {
+  console.log(`[+] New Socket Connected: ${socket.id}`);
+
   // 1. User Registration
   socket.on('register-user', ({ preferredId, userName }) => {
-    let userId = preferredId ? preferredId.toUpperCase().trim() : generateFriendlyId();
+    let userId = preferredId ? preferredId.toUpperCase().trim() : null;
     
-    // If ID already taken by someone else active, generate a new one
-    if (usersByUserId.has(userId) && usersByUserId.get(userId).socketId !== socket.id) {
+    // If ID already taken by another active socket, assign new one
+    if (!userId || (usersByUserId.has(userId) && usersByUserId.get(userId).socketId !== socket.id)) {
       userId = generateFriendlyId();
     }
 
     const userInfo = {
-      userId,
       socketId: socket.id,
-      userName: userName || `مستخدم ${userId.slice(-4)}`,
-      inCallWith: null
+      userId,
+      userName: userName || `مستخدم ${userId.slice(-4)}`
     };
 
     usersByUserId.set(userId, userInfo);
-    usersBySocketId.set(socket.id, userId);
+    usersBySocketId.set(socket.id, userInfo);
 
     socket.emit('registered', {
       userId,
-      userName: userInfo.userName
+      userName: userInfo.userName,
+      socketId: socket.id
     });
 
-    console.log(`[+] User Registered: ${userId} (${userInfo.userName}) [Socket: ${socket.id}]`);
+    console.log(`[Registered] ${userId} on Socket ${socket.id}`);
   });
 
-  // 2. Initiate Call (User A -> User B)
+  // 2. Direct Call Request (Caller -> Callee)
   socket.on('call-user', ({ userToCall, offer, callType, callerName }) => {
-    const callerId = usersBySocketId.get(socket.id);
+    const caller = usersBySocketId.get(socket.id);
     const targetId = userToCall ? userToCall.toUpperCase().trim() : null;
 
-    if (!callerId) {
+    if (!caller) {
       socket.emit('call-error', { message: 'يجب تسجيل الدخول أولاً' });
       return;
     }
 
-    if (!targetId || targetId === callerId) {
-      socket.emit('call-error', { message: 'لا يمكنك الاتصال بنفسك أو بكود فارغ!' });
+    if (!targetId || targetId === caller.userId) {
+      socket.emit('call-error', { message: 'لا يمكنك الاتصال بنفسك!' });
       return;
     }
 
@@ -81,89 +82,76 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (targetUser.inCallWith) {
-      socket.emit('call-error', { message: `المستخدم (${targetId}) مشغول في مكالمة أخرى حاليًا` });
-      return;
-    }
+    console.log(`[Call Request] ${caller.userId} (${socket.id}) -> ${targetId} (${targetUser.socketId}) [${callType}]`);
 
-    console.log(`[Call Request] ${callerId} calling ${targetId} (${callType})`);
-
-    // Notify target user
+    // Forward call with exact socket IDs for 100% direct routing
     io.to(targetUser.socketId).emit('incoming-call', {
-      callerId,
-      callerName: callerName || callerId,
+      callerId: caller.userId,
+      callerName: callerName || caller.userName || caller.userId,
+      callerSocketId: socket.id,
       offer,
       callType: callType || 'video'
     });
   });
 
-  // 3. Answer Call (User B -> User A)
-  socket.on('answer-call', ({ to, answer }) => {
-    const receiverId = usersBySocketId.get(socket.id);
-    const callerUser = usersByUserId.get(to);
+  // 3. Answer Call (Callee -> Caller)
+  socket.on('answer-call', ({ targetSocketId, targetUserId, answer }) => {
+    const receiver = usersBySocketId.get(socket.id);
+    const destSocketId = targetSocketId || (usersByUserId.get(targetUserId) ? usersByUserId.get(targetUserId).socketId : null);
 
-    if (callerUser && receiverId) {
-      const receiverUser = usersByUserId.get(receiverId);
-      if (receiverUser) receiverUser.inCallWith = to;
-      callerUser.inCallWith = receiverId;
-
-      console.log(`[Call Answered] ${receiverId} accepted call from ${to}`);
-      io.to(callerUser.socketId).emit('call-accepted', {
+    if (destSocketId) {
+      console.log(`[Call Answered] ${receiver ? receiver.userId : socket.id} accepted call from socket ${destSocketId}`);
+      io.to(destSocketId).emit('call-accepted', {
         answer,
-        answeredBy: receiverId
+        answeredBy: receiver ? receiver.userId : 'الطرف الآخر',
+        responderSocketId: socket.id
       });
+    } else {
+      console.warn(`[Answer Error] Target socket ${destSocketId} not found`);
     }
   });
 
-  // 4. Relay ICE Candidates
-  socket.on('ice-candidate', ({ to, candidate }) => {
-    const targetUser = usersByUserId.get(to);
-    if (targetUser && candidate) {
-      io.to(targetUser.socketId).emit('ice-candidate', {
+  // 4. Relay ICE Candidates directly via Socket ID
+  socket.on('ice-candidate', ({ targetSocketId, targetUserId, candidate }) => {
+    const destSocketId = targetSocketId || (usersByUserId.get(targetUserId) ? usersByUserId.get(targetUserId).socketId : null);
+    if (destSocketId && candidate) {
+      io.to(destSocketId).emit('ice-candidate', {
         candidate,
-        from: usersBySocketId.get(socket.id)
+        fromSocketId: socket.id
       });
     }
   });
 
   // 5. Reject Call
-  socket.on('reject-call', ({ to, reason }) => {
-    const targetUser = usersByUserId.get(to);
-    if (targetUser) {
-      console.log(`[Call Rejected] ${usersBySocketId.get(socket.id)} rejected call from ${to}`);
-      io.to(targetUser.socketId).emit('call-rejected', {
+  socket.on('reject-call', ({ targetSocketId, targetUserId, reason }) => {
+    const destSocketId = targetSocketId || (usersByUserId.get(targetUserId) ? usersByUserId.get(targetUserId).socketId : null);
+    if (destSocketId) {
+      console.log(`[Call Rejected] Call from ${destSocketId} was rejected`);
+      io.to(destSocketId).emit('call-rejected', {
         reason: reason || 'تم رفض المكالمة من الطرف الآخر'
       });
     }
   });
 
   // 6. End Call
-  socket.on('end-call', ({ to }) => {
-    const myId = usersBySocketId.get(socket.id);
-    const myUser = myId ? usersByUserId.get(myId) : null;
-    if (myUser) myUser.inCallWith = null;
-
-    if (to) {
-      const targetUser = usersByUserId.get(to);
-      if (targetUser) {
-        targetUser.inCallWith = null;
-        io.to(targetUser.socketId).emit('call-ended', {
-          by: myId,
-          message: 'تم إنهاء المكالمة'
-        });
-      }
+  socket.on('end-call', ({ targetSocketId, targetUserId }) => {
+    const destSocketId = targetSocketId || (usersByUserId.get(targetUserId) ? usersByUserId.get(targetUserId).socketId : null);
+    if (destSocketId) {
+      io.to(destSocketId).emit('call-ended', {
+        message: 'تم إنهاء المكالمة'
+      });
     }
-    console.log(`[Call Ended] Call between ${myId} and ${to} ended`);
+    console.log(`[Call Ended] Call with ${destSocketId} ended`);
   });
 
-  // 7. In-Call Chat Message
-  socket.on('send-message', ({ to, message, timestamp }) => {
-    const senderId = usersBySocketId.get(socket.id);
-    const targetUser = usersByUserId.get(to);
+  // 7. Instant Chat Message
+  socket.on('send-message', ({ targetSocketId, targetUserId, message, timestamp }) => {
+    const sender = usersBySocketId.get(socket.id);
+    const destSocketId = targetSocketId || (usersByUserId.get(targetUserId) ? usersByUserId.get(targetUserId).socketId : null);
 
-    if (targetUser) {
-      io.to(targetUser.socketId).emit('receive-message', {
-        from: senderId,
+    if (destSocketId) {
+      io.to(destSocketId).emit('receive-message', {
+        from: sender ? sender.userId : 'الطرف الآخر',
         message,
         timestamp: timestamp || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })
       });
@@ -172,22 +160,11 @@ io.on('connection', (socket) => {
 
   // 8. Disconnect Cleanup
   socket.on('disconnect', () => {
-    const userId = usersBySocketId.get(socket.id);
-    if (userId) {
-      const user = usersByUserId.get(userId);
-      if (user && user.inCallWith) {
-        const partner = usersByUserId.get(user.inCallWith);
-        if (partner) {
-          partner.inCallWith = null;
-          io.to(partner.socketId).emit('call-ended', {
-            by: userId,
-            message: 'انقطع اتصال الطرف الآخر'
-          });
-        }
-      }
-      usersByUserId.delete(userId);
+    const user = usersBySocketId.get(socket.id);
+    if (user) {
+      usersByUserId.delete(user.userId);
       usersBySocketId.delete(socket.id);
-      console.log(`[-] User Disconnected: ${userId}`);
+      console.log(`[-] Disconnected: ${user.userId} (${socket.id})`);
     }
   });
 });

@@ -1,21 +1,27 @@
-// WebRTC App-to-App Calling Client Logic
+// WebRTC App-to-App Calling Client Logic (High Performance & Direct Socket Routing)
 
 const socket = io();
 
-// State variables
+// State
 let myUserId = null;
 let myUserName = null;
-let currentPeerId = null;
+let currentPartnerId = null;
+let currentPartnerSocketId = null;
+
 let localStream = null;
 let remoteStream = null;
 let peerConnection = null;
+let iceCandidateQueue = [];
+
 let isAudioMuted = false;
 let isVideoMuted = false;
 let isScreenSharing = false;
 let callStartTime = null;
 let callTimerInterval = null;
+
 let pendingOffer = null;
 let pendingCallerId = null;
+let pendingCallerSocketId = null;
 let pendingCallType = 'video';
 let screenTrack = null;
 
@@ -69,13 +75,15 @@ const btnCancelOutgoing = document.getElementById('btnCancelOutgoing');
 const toastMsg = document.getElementById('toastMsg');
 const recentCallsList = document.getElementById('recentCallsList');
 
-// WebRTC Configuration (Public STUN servers)
+// Ultra-fast STUN configuration
 const rtcConfig = {
   iceServers: [
+    { urls: 'stun:stun.cloudflare.com:3478' },
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' }
-  ]
+    { urls: 'stun:stun.services.mozilla.com:3478' }
+  ],
+  iceCandidatePoolSize: 10
 };
 
 // ==========================================
@@ -90,79 +98,86 @@ function showToast(text, duration = 3500) {
 }
 
 // ==========================================
-// 2. Initial Setup & Registration
+// 2. Media Acquisition (Hardware or Canvas Fallback)
 // ==========================================
-function initApp() {
-  const savedId = localStorage.getItem('call_user_id');
-  const savedName = localStorage.getItem('call_user_name');
-
-  socket.emit('register-user', {
-    preferredId: savedId,
-    userName: savedName
-  });
-
-  // Request preview camera & mic
-  initMediaPreview();
-
-  // Load Recent Calls
-  loadRecentCalls();
-
-  // Handle URL Query Params (?call=XXXX)
-  const urlParams = new URLSearchParams(window.location.search);
-  const callParam = urlParams.get('call');
-  if (callParam) {
-    targetIdInput.value = callParam.toUpperCase().trim();
+async function acquireMediaStream(withVideo = true) {
+  if (localStream && localStream.active) {
+    return localStream;
   }
-}
 
-socket.on('registered', (data) => {
-  myUserId = data.userId;
-  myUserName = data.userName;
-  localStorage.setItem('call_user_id', myUserId);
-  localStorage.setItem('call_user_name', myUserName);
-
-  myIdDisplay.textContent = myUserId;
-  console.log(`[Registered] User ID: ${myUserId}`);
-});
-
-// Copy My ID
-copyMyIdBtn.addEventListener('click', () => {
-  if (!myUserId) return;
-  navigator.clipboard.writeText(myUserId).then(() => {
-    showToast('✅ تم نسخ الكود الخاص بك!');
-  });
-});
-
-// Copy Direct Share Link
-copyInviteBtn.addEventListener('click', () => {
-  if (!myUserId) return;
-  const link = `${window.location.origin}/?call=${myUserId}`;
-  navigator.clipboard.writeText(link).then(() => {
-    showToast('🔗 تم نسخ رابط المكالمة المباشرة!');
-  });
-});
-
-// ==========================================
-// 3. Local Media Management (Audio & Video)
-// ==========================================
-async function initMediaPreview() {
   try {
+    // Attempt standard webcam & microphone
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
-      video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+      video: withVideo ? { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 } } : false
     });
-
-    localPreviewVideo.srcObject = localStream;
-    inCallLocalVideo.srcObject = localStream;
-    cameraPlaceholder.style.display = 'none';
   } catch (err) {
-    console.warn('Could not acquire camera/mic stream:', err);
-    cameraPlaceholder.style.display = 'flex';
-    showToast('⚠️ يرجى السماح بالوصول للكاميرا والمايكروفون للاتصال');
+    console.warn('[Media] Direct camera access failed or busy, trying fallback:', err);
+    try {
+      // If camera is busy (e.g. testing in 2 tabs on same PC), get audio and make synthetic avatar video
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (withVideo) {
+        const dummyVideoTrack = createAnimatedAvatarTrack();
+        localStream.addTrack(dummyVideoTrack);
+      }
+    } catch (audioErr) {
+      console.warn('[Media] Audio also failed, creating simulated stream:', audioErr);
+      localStream = createSimulatedStream();
+    }
   }
+
+  localPreviewVideo.srcObject = localStream;
+  inCallLocalVideo.srcObject = localStream;
+  if (cameraPlaceholder) cameraPlaceholder.style.display = 'none';
+
+  return localStream;
 }
 
-// Preview Mic / Cam Toggles
+// Generates an animated avatar video track if webcam is locked by another tab
+function createAnimatedAvatarTrack() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 320;
+  canvas.height = 240;
+  const ctx = canvas.getContext('2d');
+  let angle = 0;
+
+  function render() {
+    angle += 0.05;
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Glowing circle avatar
+    ctx.beginPath();
+    ctx.arc(160, 110, 45 + Math.sin(angle) * 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#6366f1';
+    ctx.fill();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 22px Outfit, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('👤 فيديو تجريبي', 160, 118);
+
+    ctx.font = '14px Cairo, sans-serif';
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('الكاميرا قيد الاستخدام في تبويب آخر', 160, 185);
+
+    requestAnimationFrame(render);
+  }
+  render();
+
+  const stream = canvas.captureStream(15);
+  return stream.getVideoTracks()[0];
+}
+
+function createSimulatedStream() {
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const dest = audioCtx.createMediaStreamDestination();
+  const track = createAnimatedAvatarTrack();
+  dest.stream.addTrack(track);
+  return dest.stream;
+}
+
+// Preview Controls
 previewMicBtn.addEventListener('click', () => {
   toggleAudio();
   previewMicBtn.classList.toggle('off', isAudioMuted);
@@ -189,39 +204,91 @@ function toggleVideo() {
     track.enabled = !isVideoMuted;
   });
   btnCamToggle.classList.toggle('disabled', isVideoMuted);
-  if (cameraPlaceholder) {
-    cameraPlaceholder.style.display = isVideoMuted ? 'flex' : 'none';
-  }
 }
 
 // ==========================================
-// 4. Create WebRTC Peer Connection
+// 3. Application Registration (Per Tab Session)
+// ==========================================
+function initApp() {
+  // Use sessionStorage so tabs on the same machine never overwrite each other!
+  const sessionUser = sessionStorage.getItem('call_user_id');
+
+  socket.emit('register-user', {
+    preferredId: sessionUser
+  });
+
+  // Pre-acquire media for instant calls
+  acquireMediaStream(true);
+
+  // Load Recents
+  loadRecentCalls();
+
+  // Check URL query parameters (?call=XXXX)
+  const urlParams = new URLSearchParams(window.location.search);
+  const callParam = urlParams.get('call');
+  if (callParam) {
+    targetIdInput.value = callParam.toUpperCase().trim();
+  }
+}
+
+socket.on('registered', (data) => {
+  myUserId = data.userId;
+  myUserName = data.userName;
+  sessionStorage.setItem('call_user_id', myUserId);
+
+  myIdDisplay.textContent = myUserId;
+  console.log(`[Registered] My ID is: ${myUserId}`);
+});
+
+// Copy Buttons
+copyMyIdBtn.addEventListener('click', () => {
+  if (!myUserId) return;
+  navigator.clipboard.writeText(myUserId).then(() => {
+    showToast('✅ تم نسخ الكود الخاص بك!');
+  });
+});
+
+copyInviteBtn.addEventListener('click', () => {
+  if (!myUserId) return;
+  const link = `${window.location.origin}/?call=${myUserId}`;
+  navigator.clipboard.writeText(link).then(() => {
+    showToast('🔗 تم نسخ رابط المكالمة المباشرة!');
+  });
+});
+
+// ==========================================
+// 4. WebRTC Connection Setup & Candidate Queue
 // ==========================================
 function createPeerConnection() {
+  if (peerConnection) {
+    closePeer();
+  }
+
+  iceCandidateQueue = [];
   peerConnection = new RTCPeerConnection(rtcConfig);
 
-  // Add all local tracks
+  // Add tracks
   if (localStream) {
     localStream.getTracks().forEach(track => {
       peerConnection.addTrack(track, localStream);
     });
   }
 
-  // Handle incoming remote tracks
+  // Handle remote track
   peerConnection.ontrack = (event) => {
-    console.log('[WebRTC] Received remote track:', event.track.kind);
+    console.log('[WebRTC] Received remote stream track:', event.track.kind);
     remoteStream = event.streams[0];
     remoteVideo.srcObject = remoteStream;
 
-    // Start Visualizer with remote audio
+    // Start Audio Visualizer
     startAudioVisualizer(remoteStream);
   };
 
-  // Relay ICE Candidates
+  // Emit ICE Candidate via direct socket ID
   peerConnection.onicecandidate = (event) => {
-    if (event.candidate && currentPeerId) {
+    if (event.candidate && currentPartnerSocketId) {
       socket.emit('ice-candidate', {
-        to: currentPeerId,
+        targetSocketId: currentPartnerSocketId,
         candidate: event.candidate
       });
     }
@@ -229,7 +296,9 @@ function createPeerConnection() {
 
   peerConnection.onconnectionstatechange = () => {
     console.log('[WebRTC] Connection state:', peerConnection.connectionState);
-    if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed') {
+    if (peerConnection.connectionState === 'connected') {
+      console.log('✅ WebRTC Connected successfully!');
+    } else if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed') {
       endCallCleanup('انقطع الاتصال بالطرف الآخر');
     }
   };
@@ -237,13 +306,39 @@ function createPeerConnection() {
   return peerConnection;
 }
 
+function flushIceQueue() {
+  console.log(`[WebRTC] Flushing ${iceCandidateQueue.length} queued ICE candidates`);
+  while (iceCandidateQueue.length > 0) {
+    const candidate = iceCandidateQueue.shift();
+    if (peerConnection && peerConnection.remoteDescription) {
+      peerConnection.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => {
+        console.warn('Error adding queued ICE:', e);
+      });
+    }
+  }
+}
+
+// Receive ICE candidate from peer
+socket.on('ice-candidate', async (data) => {
+  if (peerConnection && peerConnection.remoteDescription && peerConnection.remoteDescription.type) {
+    try {
+      await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+    } catch (err) {
+      console.warn('Error adding ICE candidate:', err);
+    }
+  } else {
+    // Queue until setRemoteDescription finishes!
+    iceCandidateQueue.push(data.candidate);
+  }
+});
+
 // ==========================================
 // 5. Outgoing Call Flow (Caller)
 // ==========================================
 async function startCall(callType) {
   const targetId = targetIdInput.value.toUpperCase().trim();
   if (!targetId) {
-    showToast('⚠️ برجاء كتابة كود المستخدم للاتصال');
+    showToast('⚠️ برجاء إدخال كود الطرف الآخر');
     targetIdInput.focus();
     return;
   }
@@ -253,14 +348,12 @@ async function startCall(callType) {
     return;
   }
 
-  if (!localStream) {
-    await initMediaPreview();
-  }
+  // Ensure stream exists
+  await acquireMediaStream(callType === 'video');
 
-  currentPeerId = targetId;
+  currentPartnerId = targetId;
   saveRecentCall(targetId);
 
-  // Setup PeerConnection & Create Offer
   createPeerConnection();
 
   try {
@@ -274,10 +367,10 @@ async function startCall(callType) {
     outgoingTargetName.textContent = targetId;
     outgoingCallModal.classList.add('active');
 
-    // Play Ringback Tone
+    // Ringback sound
     window.soundFx.playRingback();
 
-    // Emit call request
+    // Send call offer to server
     socket.emit('call-user', {
       userToCall: targetId,
       offer,
@@ -285,8 +378,8 @@ async function startCall(callType) {
       callerName: myUserName || myUserId
     });
   } catch (err) {
-    console.error('Failed to create offer:', err);
-    showToast('حدث خطأ أثناء بدء الاتصال');
+    console.error('Failed to create call offer:', err);
+    showToast('حدث خطأ أثناء إعداد الاتصال');
   }
 }
 
@@ -297,14 +390,13 @@ btnAudioCall.addEventListener('click', () => startCall('audio'));
 btnCancelOutgoing.addEventListener('click', () => {
   window.soundFx.stopAll();
   outgoingCallModal.classList.remove('active');
-  if (currentPeerId) {
-    socket.emit('end-call', { to: currentPeerId });
+  if (currentPartnerSocketId) {
+    socket.emit('end-call', { targetSocketId: currentPartnerSocketId });
   }
   closePeer();
-  currentPeerId = null;
 });
 
-// Server responses
+// Call Error from Server
 socket.on('call-error', (data) => {
   window.soundFx.stopAll();
   outgoingCallModal.classList.remove('active');
@@ -312,6 +404,7 @@ socket.on('call-error', (data) => {
   showToast(`❌ ${data.message}`);
 });
 
+// Call Rejected
 socket.on('call-rejected', (data) => {
   window.soundFx.stopAll();
   window.soundFx.playCallEnded();
@@ -320,27 +413,32 @@ socket.on('call-rejected', (data) => {
   showToast(`🚫 ${data.reason}`);
 });
 
-// Call Accepted by Receiver
+// Call Accepted by Callee
 socket.on('call-accepted', async (data) => {
-  console.log('[WebRTC] Call accepted by:', data.answeredBy);
+  console.log('[WebRTC] Call accepted! Peer socket:', data.responderSocketId);
+  currentPartnerSocketId = data.responderSocketId;
+
+  // Stop Ringing immediately!
   window.soundFx.stopAll();
   window.soundFx.playCallConnected();
   outgoingCallModal.classList.remove('active');
 
   try {
     await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
-    openCallRoom(data.answeredBy);
+    flushIceQueue();
+    openCallRoom(data.answeredBy || currentPartnerId);
   } catch (err) {
-    console.error('Error setting remote answer:', err);
+    console.error('Error applying remote answer:', err);
   }
 });
 
 // ==========================================
-// 6. Incoming Call Flow (Receiver)
+// 6. Incoming Call Flow (Callee)
 // ==========================================
 socket.on('incoming-call', (data) => {
-  console.log('[Incoming Call] from:', data.callerId);
+  console.log('[Incoming Call] Received from:', data.callerId, 'Socket:', data.callerSocketId);
   pendingCallerId = data.callerId;
+  pendingCallerSocketId = data.callerSocketId;
   pendingOffer = data.offer;
   pendingCallType = data.callType;
 
@@ -351,73 +449,70 @@ socket.on('incoming-call', (data) => {
   window.soundFx.playIncomingRingtone();
 });
 
-// Accept Incoming Call
+// Accept Call
 btnAcceptCall.addEventListener('click', async () => {
   window.soundFx.stopAll();
   incomingCallModal.classList.remove('active');
 
-  if (!localStream) {
-    await initMediaPreview();
-  }
+  await acquireMediaStream(pendingCallType === 'video');
 
-  currentPeerId = pendingCallerId;
+  currentPartnerId = pendingCallerId;
+  currentPartnerSocketId = pendingCallerSocketId;
+
   createPeerConnection();
 
   try {
     await peerConnection.setRemoteDescription(new RTCSessionDescription(pendingOffer));
+    flushIceQueue();
+
     const answer = await peerConnection.createAnswer();
     await peerConnection.setLocalDescription(answer);
 
+    // Send answer back with exact caller socket ID
     socket.emit('answer-call', {
-      to: currentPeerId,
+      targetSocketId: currentPartnerSocketId,
       answer
     });
 
     window.soundFx.playCallConnected();
-    openCallRoom(currentPeerId);
+    openCallRoom(currentPartnerId);
   } catch (err) {
-    console.error('Error accepting call:', err);
+    console.error('Error answering call:', err);
     showToast('حدث خطأ أثناء قبول المكالمة');
   }
 });
 
-// Decline Incoming Call
+// Decline Call
 btnDeclineCall.addEventListener('click', () => {
   window.soundFx.stopAll();
   incomingCallModal.classList.remove('active');
 
-  if (pendingCallerId) {
+  if (pendingCallerSocketId) {
     socket.emit('reject-call', {
-      to: pendingCallerId,
+      targetSocketId: pendingCallerSocketId,
       reason: 'تم رفض المكالمة'
     });
   }
   pendingCallerId = null;
+  pendingCallerSocketId = null;
   pendingOffer = null;
 });
 
 // ==========================================
-// 7. ICE Candidate Exchange
-// ==========================================
-socket.on('ice-candidate', async (data) => {
-  try {
-    if (peerConnection && data.candidate) {
-      await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-    }
-  } catch (err) {
-    console.error('Error adding ICE candidate:', err);
-  }
-});
-
-// ==========================================
-// 8. Active Call Room View & Controls
+// 7. Active Call Room & Controls
 // ==========================================
 function openCallRoom(peerId) {
   callRoomView.classList.add('active');
   roomPeerName.textContent = peerId;
   roomPeerAvatar.textContent = peerId.slice(-2);
 
-  // Start Call Timer
+  // Fallback cover if audio call
+  if (pendingCallType === 'audio') {
+    remoteAudioCover.style.display = 'flex';
+  } else {
+    remoteAudioCover.style.display = 'none';
+  }
+
   callStartTime = Date.now();
   updateTimer();
   callTimerInterval = setInterval(updateTimer, 1000);
@@ -430,7 +525,6 @@ function updateTimer() {
   callTimerDisplay.textContent = `${minutes}:${seconds}`;
 }
 
-// In-Call Controls
 btnMicToggle.addEventListener('click', () => {
   toggleAudio();
 });
@@ -443,12 +537,9 @@ btnCamToggle.addEventListener('click', () => {
 btnScreenToggle.addEventListener('click', async () => {
   if (!isScreenSharing) {
     try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true
-      });
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
       screenTrack = screenStream.getVideoTracks()[0];
 
-      // Replace video track in peer connection
       const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
       if (sender) {
         sender.replaceTrack(screenTrack);
@@ -459,12 +550,11 @@ btnScreenToggle.addEventListener('click', async () => {
       btnScreenToggle.classList.add('active');
       isScreenSharing = true;
 
-      // Handle user stopping screen share from browser banner
       screenTrack.onended = () => {
         stopScreenShare();
       };
     } catch (err) {
-      console.warn('Screen share cancelled or failed:', err);
+      console.warn('Screen share cancelled:', err);
     }
   } else {
     stopScreenShare();
@@ -473,9 +563,7 @@ btnScreenToggle.addEventListener('click', async () => {
 
 function stopScreenShare() {
   if (!isScreenSharing) return;
-  if (screenTrack) {
-    screenTrack.stop();
-  }
+  if (screenTrack) screenTrack.stop();
 
   const videoTrack = localStream ? localStream.getVideoTracks()[0] : null;
   const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
@@ -489,10 +577,10 @@ function stopScreenShare() {
   isScreenSharing = false;
 }
 
-// End Call Action
+// End Call
 btnEndCall.addEventListener('click', () => {
-  if (currentPeerId) {
-    socket.emit('end-call', { to: currentPeerId });
+  if (currentPartnerSocketId) {
+    socket.emit('end-call', { targetSocketId: currentPartnerSocketId });
   }
   endCallCleanup('تم إنهاء المكالمة');
 });
@@ -518,8 +606,10 @@ function endCallCleanup(reason) {
   outgoingCallModal.classList.remove('active');
   incomingCallModal.classList.remove('active');
 
-  currentPeerId = null;
+  currentPartnerId = null;
+  currentPartnerSocketId = null;
   pendingCallerId = null;
+  pendingCallerSocketId = null;
   pendingOffer = null;
 
   showToast(reason);
@@ -531,10 +621,11 @@ function closePeer() {
     peerConnection = null;
   }
   remoteVideo.srcObject = null;
+  iceCandidateQueue = [];
 }
 
 // ==========================================
-// 9. In-Call Chat Messaging
+// 8. In-Call Chat
 // ==========================================
 btnToggleChat.addEventListener('click', () => {
   chatDrawer.classList.toggle('hidden');
@@ -543,23 +634,18 @@ btnToggleChat.addEventListener('click', () => {
 
 btnSendMsg.addEventListener('click', sendChatMessage);
 chatInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
-    sendChatMessage();
-  }
+  if (e.key === 'Enter') sendChatMessage();
 });
 
 function sendChatMessage() {
   const text = chatInput.value.trim();
-  if (!text || !currentPeerId) return;
+  if (!text || !currentPartnerSocketId) return;
 
   const nowTime = new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
-
-  // Append mine
   appendMessage(text, 'mine', nowTime);
 
-  // Send to peer
   socket.emit('send-message', {
-    to: currentPeerId,
+    targetSocketId: currentPartnerSocketId,
     message: text,
     timestamp: nowTime
   });
@@ -589,7 +675,7 @@ function escapeHtml(str) {
 }
 
 // ==========================================
-// 10. Real-time Audio Visualizer
+// 9. Real-time Audio Visualizer
 // ==========================================
 function startAudioVisualizer(stream) {
   try {
@@ -648,7 +734,7 @@ function stopAudioVisualizer() {
 }
 
 // ==========================================
-// 11. Recent Calls Memory (LocalStorage)
+// 10. Recents Storage
 // ==========================================
 function saveRecentCall(peerId) {
   let recents = JSON.parse(localStorage.getItem('recent_calls') || '[]');
@@ -689,5 +775,5 @@ window.dialRecent = function(id) {
   startCall('video');
 };
 
-// Start everything
+// Start
 window.addEventListener('DOMContentLoaded', initApp);
