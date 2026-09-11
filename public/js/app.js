@@ -13,6 +13,7 @@ let remoteStream = null;
 let peerConnection = null;
 let iceCandidateQueue = [];
 
+let currentFacingMode = 'user'; // 'user' (front) or 'environment' (back)
 let isAudioMuted = false;
 let isVideoMuted = false;
 let isScreenSharing = false;
@@ -41,6 +42,7 @@ const localPreviewVideo = document.getElementById('localPreviewVideo');
 const cameraPlaceholder = document.getElementById('cameraPlaceholder');
 const previewMicBtn = document.getElementById('previewMicBtn');
 const previewCamBtn = document.getElementById('previewCamBtn');
+const previewFlipBtn = document.getElementById('previewFlipBtn');
 
 // Active Room Elements
 const callRoomView = document.getElementById('callRoomView');
@@ -53,10 +55,14 @@ const roomPeerAvatar = document.getElementById('roomPeerAvatar');
 const callTimerDisplay = document.getElementById('callTimerDisplay');
 const btnMicToggle = document.getElementById('btnMicToggle');
 const btnCamToggle = document.getElementById('btnCamToggle');
+const btnInCallFlipCam = document.getElementById('btnInCallFlipCam');
 const btnScreenToggle = document.getElementById('btnScreenToggle');
 const btnEndCall = document.getElementById('btnEndCall');
 const btnToggleChat = document.getElementById('btnToggleChat');
+const chatUnreadDot = document.getElementById('chatUnreadDot');
 const chatDrawer = document.getElementById('chatDrawer');
+const btnCloseChatBtn = document.getElementById('btnCloseChatBtn');
+const chatSheetClose = document.getElementById('chatSheetClose');
 const chatMessages = document.getElementById('chatMessages');
 const chatInput = document.getElementById('chatInput');
 const btnSendMsg = document.getElementById('btnSendMsg');
@@ -187,6 +193,47 @@ previewCamBtn.addEventListener('click', () => {
   toggleVideo();
   previewCamBtn.classList.toggle('off', isVideoMuted);
 });
+
+if (previewFlipBtn) {
+  previewFlipBtn.addEventListener('click', flipCamera);
+}
+if (btnInCallFlipCam) {
+  btnInCallFlipCam.addEventListener('click', flipCamera);
+}
+
+async function flipCamera() {
+  currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: currentFacingMode, width: { ideal: 640 }, height: { ideal: 480 } }
+    });
+    const newVideoTrack = newStream.getVideoTracks()[0];
+
+    const oldTrack = localStream ? localStream.getVideoTracks()[0] : null;
+    if (oldTrack) {
+      oldTrack.stop();
+      localStream.removeTrack(oldTrack);
+    }
+    if (localStream) {
+      localStream.addTrack(newVideoTrack);
+    }
+
+    localPreviewVideo.srcObject = localStream;
+    inCallLocalVideo.srcObject = localStream;
+
+    if (peerConnection) {
+      const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (sender) {
+        sender.replaceTrack(newVideoTrack);
+      }
+    }
+    showToast(currentFacingMode === 'user' ? '📷 الكاميرا الأمامية' : '📷 الكاميرا الخلفية');
+  } catch (err) {
+    console.warn('Could not flip camera:', err);
+    showToast('⚠️ لا يمكن تبديل الكاميرا على هذا الجهاز');
+  }
+}
 
 function toggleAudio() {
   if (!localStream) return;
@@ -629,8 +676,15 @@ function closePeer() {
 // ==========================================
 btnToggleChat.addEventListener('click', () => {
   chatDrawer.classList.toggle('hidden');
-  btnToggleChat.classList.toggle('active');
+  if (chatUnreadDot) chatUnreadDot.classList.remove('show');
 });
+
+if (btnCloseChatBtn) {
+  btnCloseChatBtn.addEventListener('click', () => chatDrawer.classList.add('hidden'));
+}
+if (chatSheetClose) {
+  chatSheetClose.addEventListener('click', () => chatDrawer.classList.add('hidden'));
+}
 
 btnSendMsg.addEventListener('click', sendChatMessage);
 chatInput.addEventListener('keydown', (e) => {
@@ -655,7 +709,67 @@ function sendChatMessage() {
 
 socket.on('receive-message', (data) => {
   appendMessage(data.message, 'theirs', data.timestamp);
+  if (chatDrawer.classList.contains('hidden') && chatUnreadDot) {
+    chatUnreadDot.classList.add('show');
+  }
 });
+
+// Mobile Touch & Mouse Draggable PiP Floating Video
+(function setupDraggablePiP() {
+  let isDragging = false;
+  let startX, startY, initialLeft, initialTop;
+
+  // Touch on Mobile
+  localVideoWrapper.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) {
+      isDragging = true;
+      const touch = e.touches[0];
+      startX = touch.clientX;
+      startY = touch.clientY;
+      const rect = localVideoWrapper.getBoundingClientRect();
+      initialLeft = rect.left;
+      initialTop = rect.top;
+    }
+  }, { passive: true });
+
+  window.addEventListener('touchmove', (e) => {
+    if (!isDragging) return;
+    const touch = e.touches[0];
+    const deltaX = touch.clientX - startX;
+    const deltaY = touch.clientY - startY;
+
+    localVideoWrapper.style.left = `${Math.max(10, Math.min(window.innerWidth - 120, initialLeft + deltaX))}px`;
+    localVideoWrapper.style.top = `${Math.max(70, Math.min(window.innerHeight - 170, initialTop + deltaY))}px`;
+    localVideoWrapper.style.bottom = 'auto';
+  }, { passive: true });
+
+  window.addEventListener('touchend', () => {
+    isDragging = false;
+  });
+
+  // Mouse drag on Desktop
+  localVideoWrapper.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    startX = e.clientX;
+    startY = e.clientY;
+    const rect = localVideoWrapper.getBoundingClientRect();
+    initialLeft = rect.left;
+    initialTop = rect.top;
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const deltaX = e.clientX - startX;
+    const deltaY = e.clientY - startY;
+    localVideoWrapper.style.left = `${Math.max(10, Math.min(window.innerWidth - 120, initialLeft + deltaX))}px`;
+    localVideoWrapper.style.top = `${Math.max(70, Math.min(window.innerHeight - 170, initialTop + deltaY))}px`;
+    localVideoWrapper.style.bottom = 'auto';
+  });
+
+  window.addEventListener('mouseup', () => {
+    isDragging = false;
+  });
+})();
 
 function appendMessage(text, senderClass, timestamp) {
   const msgEl = document.createElement('div');
