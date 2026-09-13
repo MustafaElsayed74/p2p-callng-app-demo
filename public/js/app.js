@@ -3,7 +3,13 @@
 // Modular, Responsive, Production-Grade Client Logic
 // =========================================================================
 
-const socket = io();
+// Determine socket connection origin dynamically (handles localhost:3500, Live Server, or file://)
+let socketServerUrl = undefined;
+if (window.location.protocol === 'file:' || (window.location.port && window.location.port !== '3500')) {
+  socketServerUrl = 'http://localhost:3500';
+}
+
+const socket = (typeof io !== 'undefined') ? (socketServerUrl ? io(socketServerUrl) : io()) : null;
 
 // Application State
 const AppState = {
@@ -1095,17 +1101,20 @@ window.dialRecent = function(id) {
 };
 
 // =========================================================================
-// 14. Application Initialization
 // =========================================================================
-function initApp() {
-  // Session-isolated ID per tab so multiple tabs on same PC never conflict
+// 14. Application Initialization & Auto Registration
+// =========================================================================
+function registerMe() {
+  if (!socket) return;
   const sessionUser = sessionStorage.getItem('cp_session_user');
-
+  console.log('[Socket] Emitting register-user, preferredId:', sessionUser);
   socket.emit('register-user', {
     preferredId: sessionUser,
     userName: AppState.myUserName
   });
+}
 
+function initApp() {
   // Pre-initialize media & device enumeration
   DeviceManager.init();
   acquireMediaStream(true);
@@ -1118,15 +1127,50 @@ function initApp() {
   if (callParam) {
     UI.targetIdInput.value = callParam.toUpperCase().trim();
   }
+
+  // Register with server
+  registerMe();
 }
 
-socket.on('registered', (data) => {
-  AppState.myUserId = data.userId;
-  sessionStorage.setItem('cp_session_user', AppState.myUserId);
+if (socket) {
+  socket.on('connect', () => {
+    console.log('[Socket] Connected to server, ID:', socket.id);
+    registerMe();
+  });
 
-  if (UI.myIdDisplay) UI.myIdDisplay.textContent = AppState.myUserId;
-  console.log(`[Registered] ID: ${AppState.myUserId}`);
-});
+  socket.on('reconnect', () => {
+    console.log('[Socket] Reconnected to server');
+    registerMe();
+  });
+
+  socket.on('registered', (data) => {
+    console.log('[Socket] User successfully registered:', data);
+    AppState.myUserId = data.userId;
+    AppState.myUserName = data.userName;
+    sessionStorage.setItem('cp_session_user', AppState.myUserId);
+
+    if (UI.myIdDisplay) {
+      UI.myIdDisplay.textContent = AppState.myUserId;
+    }
+  });
+
+  socket.on('connect_error', (err) => {
+    console.warn('[Socket] Connection error:', err.message);
+    if (UI.myIdDisplay && UI.myIdDisplay.textContent === '...') {
+      UI.myIdDisplay.textContent = 'غير متصل';
+    }
+    showToast('⚠️ تعذر الاتصال بالسيرفر! تأكد من تشغيل: node server.js');
+  });
+
+  if (socket.connected) {
+    registerMe();
+  }
+} else {
+  console.error('[Socket] Socket.io client not available');
+  if (UI.myIdDisplay) {
+    UI.myIdDisplay.textContent = 'خطأ اتصال';
+  }
+}
 
 // Event Listeners
 UI.btnVideoCall.addEventListener('click', () => startCall('video'));
@@ -1171,4 +1215,9 @@ if (UI.btnClearInput) {
   });
 }
 
-window.addEventListener('DOMContentLoaded', initApp);
+// Ensure initApp runs whether DOM is already ready or loading
+if (document.readyState === 'loading') {
+  window.addEventListener('DOMContentLoaded', initApp);
+} else {
+  initApp();
+}
